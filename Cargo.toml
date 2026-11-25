@@ -1,0 +1,8 @@
+[package]
+name = "readmd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = { version = "0.11.0", default-features = false, features = ["gpui-fast"] }
+rfd = "0.18.0"
