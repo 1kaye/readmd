@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
@@ -7,25 +8,35 @@ use gpui_kit::{
     prelude::FluentBuilder as _, rems,
 };
 
-use super::command::{Command, parse_command};
+use super::command::{Command, HintList, command_hints, parse_command, resolve_font_name};
 use super::command_bar::CommandBar;
 use super::mode::{
     EditorMode, expand_user_path, file_display_name, load_markdown_file, save_markdown_file,
     window_title_for_state,
 };
 use super::status_bar::{StatusBar, StatusNotice};
-use super::{EnterInsertMode, EnterNormalMode, OpenCommand, OpenFile, SaveFile};
+use super::{
+    CommandCompleteHint, CommandNextHint, CommandPrevHint, EnterInsertMode, EnterNormalMode,
+    OpenCommand, OpenFile, SaveFile,
+};
 use crate::{keymap, theme};
 
+const NOTICE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Retained workspace owning the active Markdown buffer, modal state,
-/// plain-text editor, rendered preview, top-center command line, file I/O tasks,
-/// and theme synchronization.
+/// plain-text editor, rendered preview, top-center command line, font state,
+/// auto-dismissing notices, file I/O tasks, and theme synchronization.
 pub struct DocumentWorkspace {
     mode: EditorMode,
     path: Option<PathBuf>,
     saved_source: String,
     is_dirty: bool,
     notice: Option<StatusNotice>,
+    notice_id: u64,
+    _notice_timer: Option<Task<()>>,
+    document_font: Option<SharedString>,
+    available_fonts: Vec<SharedString>,
+    selected_hint_ix: Option<usize>,
     editor: Entity<base::input::TextareaState>,
     preview: Entity<base::TextViewState>,
     command_input: Entity<base::input::InputState>,
@@ -58,6 +69,8 @@ impl DocumentWorkspace {
         // Start in Insert mode with the plain-text editor focused immediately.
         editor.update(cx, |state, cx| state.focus(window, cx));
 
+        let available_fonts = collect_system_fonts(cx);
+
         let weak_editor = editor.downgrade();
         let weak_command = command_input.downgrade();
         let appearance_sub = window.observe_window_appearance(move |window, cx| {
@@ -78,7 +91,7 @@ impl DocumentWorkspace {
             |this, state, event: &base::input::InputEvent, window, cx| {
                 if matches!(event, base::input::InputEvent::Change) {
                     let dirty_now = state.read(cx).value().as_ref() != this.saved_source.as_str();
-                    let cleared_notice = this.notice.take().is_some();
+                    let cleared_notice = this.clear_notice();
                     if dirty_now != this.is_dirty {
                         this.is_dirty = dirty_now;
                         this.update_window_title(window);
@@ -90,25 +103,34 @@ impl DocumentWorkspace {
             },
         );
 
-        let command_submit_sub = cx.subscribe_in(
+        let command_event_sub = cx.subscribe_in(
             &command_input,
             window,
-            |this, _, event: &base::input::InputEvent, window, cx| {
-                if matches!(event, base::input::InputEvent::PressEnter { .. }) {
+            |this, _, event: &base::input::InputEvent, window, cx| match event {
+                base::input::InputEvent::Change => {
+                    this.selected_hint_ix = None;
+                    cx.notify();
+                }
+                base::input::InputEvent::PressEnter { .. } => {
                     this.submit_command_line(window, cx);
                 }
+                _ => {}
             },
         );
 
-        let notice =
-            keymap::take_startup_notice(cx).map(|msg| StatusNotice::Error(SharedString::from(msg)));
+        let startup_notice = keymap::take_startup_notice(cx);
 
-        Self {
+        let mut this = Self {
             mode: EditorMode::default(),
             path: None,
             saved_source: String::new(),
             is_dirty: false,
-            notice,
+            notice: None,
+            notice_id: 0,
+            _notice_timer: None,
+            document_font: None,
+            available_fonts,
+            selected_hint_ix: None,
             editor,
             preview,
             command_input,
@@ -117,8 +139,35 @@ impl DocumentWorkspace {
             io_in_flight: false,
             request_id: 0,
             _io_task: None,
-            _subscriptions: vec![appearance_sub, editor_change_sub, command_submit_sub],
+            _subscriptions: vec![appearance_sub, editor_change_sub, command_event_sub],
+        };
+
+        if let Some(msg) = startup_notice {
+            this.show_notice(StatusNotice::Error(SharedString::from(msg)), cx);
         }
+
+        this
+    }
+
+    fn show_notice(&mut self, notice: StatusNotice, cx: &mut Context<Self>) {
+        self.notice = Some(notice);
+        self.notice_id = self.notice_id.wrapping_add(1);
+        let id = self.notice_id;
+
+        self._notice_timer = Some(cx.spawn(async move |weak_this, cx| {
+            cx.background_executor().timer(NOTICE_TIMEOUT).await;
+            _ = weak_this.update(cx, |this, cx| {
+                if this.notice_id == id && this.notice.take().is_some() {
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn clear_notice(&mut self) -> bool {
+        self.notice_id = self.notice_id.wrapping_add(1);
+        self._notice_timer = None;
+        self.notice.take().is_some()
     }
 
     fn current_directory(&self) -> Option<PathBuf> {
@@ -133,11 +182,33 @@ impl DocumentWorkspace {
         window.set_window_title(&window_title_for_state(self.path.as_deref(), self.is_dirty));
     }
 
+    fn current_command_hints(&self, cx: &Context<Self>) -> HintList {
+        let raw = self.command_input.read(cx).value();
+        command_hints(&raw, &self.available_fonts, self.document_font.as_deref())
+    }
+
+    fn set_command_input_text(
+        &mut self,
+        text: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value: SharedString = text.into();
+        let utf16_end = value.as_ref().encode_utf16().count() as u32;
+        self.selected_hint_ix = None;
+        self.command_input.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+            input.set_cursor_position(base::input::Position::new(0, utf16_end), window, cx);
+        });
+        cx.notify();
+    }
+
     fn enter_insert_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode == EditorMode::Insert {
             return;
         }
         if self.mode == EditorMode::Command {
+            self.selected_hint_ix = None;
             self.command_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -152,6 +223,7 @@ impl DocumentWorkspace {
             return;
         }
         if self.mode == EditorMode::Command {
+            self.selected_hint_ix = None;
             self.command_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
         } else {
@@ -168,7 +240,8 @@ impl DocumentWorkspace {
         if self.mode != EditorMode::Normal {
             return;
         }
-        self.notice = None;
+        self.clear_notice();
+        self.selected_hint_ix = None;
         self.mode = EditorMode::Command;
         self.command_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
@@ -181,6 +254,7 @@ impl DocumentWorkspace {
         if self.mode != EditorMode::Command {
             return;
         }
+        self.selected_hint_ix = None;
         self.command_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.mode = EditorMode::Normal;
@@ -188,17 +262,114 @@ impl DocumentWorkspace {
         cx.notify();
     }
 
+    fn on_command_next_hint(
+        &mut self,
+        _: &CommandNextHint,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mode != EditorMode::Command {
+            return;
+        }
+        let len = self.current_command_hints(cx).items.len();
+        if len == 0 {
+            return;
+        }
+        self.selected_hint_ix = Some(match self.selected_hint_ix {
+            Some(ix) => (ix + 1) % len,
+            None => 0,
+        });
+        cx.notify();
+    }
+
+    fn on_command_prev_hint(
+        &mut self,
+        _: &CommandPrevHint,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mode != EditorMode::Command {
+            return;
+        }
+        let len = self.current_command_hints(cx).items.len();
+        if len == 0 {
+            return;
+        }
+        self.selected_hint_ix = Some(match self.selected_hint_ix {
+            Some(0) | None => len - 1,
+            Some(ix) => ix - 1,
+        });
+        cx.notify();
+    }
+
+    fn on_command_complete_hint(
+        &mut self,
+        _: &CommandCompleteHint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mode != EditorMode::Command {
+            return;
+        }
+        let hints = self.current_command_hints(cx);
+        let ix = self.selected_hint_ix.unwrap_or(0);
+        if let Some(hint) = hints.items.get(ix) {
+            self.set_command_input_text(hint.insert_text.clone(), window, cx);
+        }
+    }
+
+    fn select_hint(
+        &mut self,
+        insert_text: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if insert_text.ends_with(' ') {
+            self.set_command_input_text(insert_text, window, cx);
+            return;
+        }
+        self.selected_hint_ix = None;
+        self.command_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.mode = EditorMode::Normal;
+        self.focus_handle.focus(window, cx);
+        self.execute_command_text(&insert_text, window, cx);
+    }
+
     fn submit_command_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode != EditorMode::Command {
             return;
         }
+
+        // If the user explicitly highlighted a hint with Up/Down, execute or expand it.
+        if let Some(ix) = self.selected_hint_ix {
+            let hints = self.current_command_hints(cx);
+            if let Some(hint) = hints.items.get(ix) {
+                let insert_text = hint.insert_text.clone();
+                self.select_hint(insert_text, window, cx);
+                return;
+            }
+        }
+
         let raw = self.command_input.read(cx).value();
+
+        // `:Font` with no argument expands to `Font ` so the user can pick from system fonts.
+        if matches!(parse_command(&raw), Ok(Command::SetFont { name: None })) {
+            self.set_command_input_text("Font ", window, cx);
+            return;
+        }
+
+        self.selected_hint_ix = None;
         self.command_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.mode = EditorMode::Normal;
         self.focus_handle.focus(window, cx);
 
-        match parse_command(&raw) {
+        self.execute_command_text(&raw, window, cx);
+    }
+
+    fn execute_command_text(&mut self, raw: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match parse_command(raw) {
             Ok(Command::Noop) => cx.notify(),
             Ok(Command::Write { path }) => {
                 let target = path.map(|raw_path| {
@@ -214,9 +385,12 @@ impl DocumentWorkspace {
             }
             Ok(Command::Quit { force }) => {
                 if !force && self.is_dirty {
-                    self.notice = Some(StatusNotice::Error(SharedString::from(
-                        "No write since last change (use :q! to override)",
-                    )));
+                    self.show_notice(
+                        StatusNotice::Error(SharedString::from(
+                            "No write since last change (use :q! to override)",
+                        )),
+                        cx,
+                    );
                     cx.notify();
                 } else {
                     window.remove_window();
@@ -231,27 +405,27 @@ impl DocumentWorkspace {
                 let target = expand_user_path(&raw_path, self.current_directory().as_deref());
                 self.load_file_from_path(target, EditorMode::on_file_loaded(), window, cx);
             }
-            Ok(Command::EditKeymaps) => match keymap::ensure_config_file(cx) {
-                Ok(path) => self.load_file_from_path(path, EditorMode::Insert, window, cx),
-                Err(err) => {
-                    self.notice = Some(StatusNotice::Error(err.into()));
-                    cx.notify();
-                }
-            },
-            Ok(Command::ReloadKeymaps) => {
-                match keymap::reload(cx) {
-                    Ok(()) => {
-                        self.notice =
-                            Some(StatusNotice::Info(SharedString::from("Keymaps reloaded")));
+            Ok(Command::SetFont { name: Some(name) }) => {
+                match resolve_font_name(&name, &self.available_fonts) {
+                    Ok(resolved) => {
+                        let label = match &resolved {
+                            Some(family) => format!("Font set to {family}"),
+                            None => "Font reset to default".to_string(),
+                        };
+                        self.document_font = resolved;
+                        self.show_notice(StatusNotice::Info(SharedString::from(label)), cx);
+                        window.refresh();
+                        cx.notify();
                     }
                     Err(err) => {
-                        self.notice = Some(StatusNotice::Error(err.into()));
+                        self.show_notice(StatusNotice::Error(err.into()), cx);
+                        cx.notify();
                     }
                 }
-                cx.notify();
             }
+            Ok(Command::SetFont { name: None }) => cx.notify(),
             Err(err) => {
-                self.notice = Some(StatusNotice::Error(err.into()));
+                self.show_notice(StatusNotice::Error(err.into()), cx);
                 cx.notify();
             }
         }
@@ -494,7 +668,7 @@ impl DocumentWorkspace {
                 self.saved_source = source;
                 self.is_dirty = false;
                 self.path = Some(path);
-                self.notice = None;
+                self.clear_notice();
                 self.mode = target_mode;
                 self.scroll_handle
                     .set_offset(point(Pixels::ZERO, Pixels::ZERO));
@@ -511,7 +685,7 @@ impl DocumentWorkspace {
             }
             Err(message) => {
                 // Keep existing buffer intact while surfacing the load failure in the status bar.
-                self.notice = Some(StatusNotice::Error(message.into()));
+                self.show_notice(StatusNotice::Error(message.into()), cx);
             }
         }
         cx.notify();
@@ -539,21 +713,28 @@ impl DocumentWorkspace {
                 if keymap::is_config_path(&path, cx) {
                     match keymap::reload(cx) {
                         Ok(()) => {
-                            self.notice = Some(StatusNotice::Info(SharedString::from(format!(
-                                "Saved {display} (keymaps reloaded)"
-                            ))));
+                            self.show_notice(
+                                StatusNotice::Info(SharedString::from(format!(
+                                    "Saved {display} (keymaps reloaded)"
+                                ))),
+                                cx,
+                            );
                         }
                         Err(err) => {
                             reload_failed = true;
-                            self.notice = Some(StatusNotice::Error(SharedString::from(format!(
-                                "Saved {display}, keymap error: {err}"
-                            ))));
+                            self.show_notice(
+                                StatusNotice::Error(SharedString::from(format!(
+                                    "Saved {display}, keymap error: {err}"
+                                ))),
+                                cx,
+                            );
                         }
                     }
                 } else {
-                    self.notice = Some(StatusNotice::Info(SharedString::from(format!(
-                        "Saved {display}"
-                    ))));
+                    self.show_notice(
+                        StatusNotice::Info(SharedString::from(format!("Saved {display}"))),
+                        cx,
+                    );
                 }
 
                 if quit_after_save && !reload_failed {
@@ -562,13 +743,18 @@ impl DocumentWorkspace {
                 }
             }
             Err(message) => {
-                self.notice = Some(StatusNotice::Error(message.into()));
+                self.show_notice(StatusNotice::Error(message.into()), cx);
             }
         }
         cx.notify();
     }
 
     fn render_editor_pane(&self, theme: &base::Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor_font = self
+            .document_font
+            .clone()
+            .unwrap_or_else(|| theme.tokens.typography.mono.clone());
+
         div()
             .id("document-editor-pane")
             .flex()
@@ -592,7 +778,7 @@ impl DocumentWorkspace {
                     .px_8()
                     .pt_8()
                     .pb_6()
-                    .font_family(theme.tokens.typography.mono.clone())
+                    .font_family(editor_font)
                     .text_sm()
                     .child(base::input::Textarea::new(&self.editor)),
             )
@@ -618,6 +804,9 @@ impl DocumentWorkspace {
                             .mx_auto()
                             .px_8()
                             .py_8()
+                            .when_some(self.document_font.clone(), |this, font| {
+                                this.font_family(font)
+                            })
                             .child(
                                 base::TextView::new(&self.preview)
                                     .style(theme::document_style(theme)),
@@ -632,6 +821,13 @@ impl DocumentWorkspace {
                 ),
             )
     }
+}
+
+fn collect_system_fonts(cx: &Context<DocumentWorkspace>) -> Vec<SharedString> {
+    let mut names = cx.text_system().all_font_names();
+    names.sort_by_key(|a| a.to_ascii_lowercase());
+    names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    names.into_iter().map(SharedString::from).collect()
 }
 
 impl Render for DocumentWorkspace {
@@ -657,6 +853,11 @@ impl Render for DocumentWorkspace {
             .notice(self.notice.clone())
             .on_toggle_mode(cx.listener(|this, _, window, cx| this.toggle_mode(window, cx)));
 
+        let command_hints = (self.mode == EditorMode::Command).then(|| {
+            let raw = self.command_input.read(cx).value();
+            command_hints(&raw, &self.available_fonts, self.document_font.as_deref())
+        });
+
         div()
             .id("document-workspace")
             .key_context(self.mode.key_context())
@@ -666,6 +867,9 @@ impl Render for DocumentWorkspace {
             .on_action(cx.listener(Self::on_enter_insert_mode))
             .on_action(cx.listener(Self::on_enter_normal_mode))
             .on_action(cx.listener(Self::on_open_command))
+            .on_action(cx.listener(Self::on_command_next_hint))
+            .on_action(cx.listener(Self::on_command_prev_hint))
+            .on_action(cx.listener(Self::on_command_complete_hint))
             .on_action(cx.listener(Self::on_input_escape))
             .relative()
             .flex()
@@ -675,12 +879,20 @@ impl Render for DocumentWorkspace {
             .text_color(colors.foreground)
             .child(content)
             .child(status_bar)
-            .when(self.mode == EditorMode::Command, |this| {
-                this.child(CommandBar::new(&self.command_input).on_dismiss(cx.listener(
-                    |this, _, window, cx| {
-                        this.close_command_line(window, cx);
-                    },
-                )))
+            .when_some(command_hints, |this, hints| {
+                let entity = cx.entity().downgrade();
+                this.child(
+                    CommandBar::new(&self.command_input, hints)
+                        .selected_ix(self.selected_hint_ix)
+                        .on_dismiss(cx.listener(|this, _, window, cx| {
+                            this.close_command_line(window, cx);
+                        }))
+                        .on_select_hint(move |insert_text, window, cx| {
+                            _ = entity.update(cx, |this, cx| {
+                                this.select_hint(insert_text, window, cx);
+                            });
+                        }),
+                )
             })
     }
 }

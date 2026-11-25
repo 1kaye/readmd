@@ -3,13 +3,17 @@ use std::rc::Rc;
 
 use gpui_kit::{Action, App, Global, KeyBinding, KeyBindingContextPredicate};
 
-use crate::document::{EnterInsertMode, EnterNormalMode, OpenCommand, OpenFile, SaveFile};
+use crate::document::{
+    CommandCompleteHint, CommandNextHint, CommandPrevHint, EnterInsertMode, EnterNormalMode,
+    OpenCommand, OpenFile, SaveFile,
+};
 
 const WORKSPACE_CONTEXT: &str = "DocumentWorkspace";
 const NORMAL_PREDICATE: &str = "DocumentWorkspace && mode == normal";
 const INSERT_PREDICATE: &str = "DocumentWorkspace && mode == insert";
 const INSERT_INPUT_PREDICATE: &str = "DocumentWorkspace && mode == insert > Input";
 const COMMAND_PREDICATE: &str = "DocumentWorkspace && mode == command";
+const COMMAND_INPUT_PREDICATE: &str = "DocumentWorkspace && mode == command > Input";
 
 pub const DEFAULT_KEYMAPS_TOML: &str = "\
 # readmd keybindings
@@ -17,7 +21,6 @@ pub const DEFAULT_KEYMAPS_TOML: &str = "\
 #   single key : \"ctrl-s\", \"secondary-o\", \"i\", \"escape\", \":\"
 #   chord      : \"space w\", \"j k\"
 #   multiple   : [\"i\", \"a\"]
-# Run :keymap inside readmd to edit and save for live reload, or :reload after editing externally.
 
 open_file = \"secondary-o\"
 save_file = \"secondary-s\"
@@ -115,15 +118,6 @@ pub fn take_startup_notice(cx: &mut App) -> Option<String> {
     cx.global_mut::<KeymapRegistry>().startup_notice.take()
 }
 
-/// Ensures the user keymap file exists on disk and returns its path.
-pub fn ensure_config_file(cx: &App) -> Result<PathBuf, String> {
-    let path = config_path(cx).ok_or_else(|| "Could not determine config directory".to_string())?;
-    if !path.exists() {
-        write_default_config(&path)?;
-    }
-    Ok(path)
-}
-
 /// Atomically reloads keybindings from disk. If parsing or keystroke validation fails,
 /// keeps the previously active keymap intact and returns the error message.
 pub fn reload(cx: &mut App) -> Result<(), String> {
@@ -203,6 +197,7 @@ fn apply_bindings(
     let insert_ctx = parse_context(INSERT_PREDICATE)?;
     let insert_input_ctx = parse_context(INSERT_INPUT_PREDICATE)?;
     let command_ctx = parse_context(COMMAND_PREDICATE)?;
+    let command_input_ctx = parse_context(COMMAND_INPUT_PREDICATE)?;
 
     push_bindings(
         &mut app_bindings,
@@ -232,6 +227,26 @@ fn apply_bindings(
         &normal_ctx,
         cx,
     )?;
+
+    // Command bar navigation and completion (supersedes single-line Input up/down/tab).
+    for ctx in [&command_ctx, &command_input_ctx] {
+        for (key, make_action) in [
+            (
+                "down",
+                (|| Box::new(CommandNextHint) as Box<dyn Action>) as fn() -> Box<dyn Action>,
+            ),
+            ("ctrl-n", || Box::new(CommandNextHint)),
+            ("up", || Box::new(CommandPrevHint)),
+            ("ctrl-p", || Box::new(CommandPrevHint)),
+            ("shift-tab", || Box::new(CommandPrevHint)),
+            ("tab", || Box::new(CommandCompleteHint)),
+        ] {
+            let binding = KeyBinding::load(key, make_action(), Some(ctx.clone()), false, None, cx)
+                .map_err(|err| format!("Invalid keybinding '{key}': {err}"))?;
+            app_bindings.push(binding);
+        }
+    }
+
     app_bindings.push(
         KeyBinding::load(
             "escape",

@@ -17,5 +17,8 @@ actions!(
         EnterInsertMode,
         EnterNormalMode,
         OpenCommand,
+        CommandNextHint,
+        CommandPrevHint,
+        CommandCompleteHint,
     ]
 );
