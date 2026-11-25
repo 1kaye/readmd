@@ -1,4 +1,5 @@
 mod document;
+mod keymap;
 mod theme;
 
 use gpui_kit::{AppContext as _, Bounds, Pixels, WindowBounds, WindowOptions, px, size};
@@ -12,7 +13,7 @@ const MIN_WINDOW_HEIGHT: Pixels = px(240.);
 fn main() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
-        document::bind_keys(cx);
+        keymap::init(cx);
 
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {

@@ -29,6 +29,12 @@ pub fn sync_with_appearance(appearance: WindowAppearance, cx: &mut App) {
     } else {
         base::ColorTokens::light()
     };
+    let shadow_color = if is_dark {
+        hsla(0.0, 0.0, 0.0, 0.45)
+    } else {
+        hsla(0.0, 0.0, 0.0, 0.14)
+    };
+    theme.tokens.shadow = base::ShadowTokens::elevations(shadow_color);
 }
 
 pub fn document_style(theme: &base::Theme) -> base::TextViewStyle {
@@ -64,12 +70,20 @@ pub fn mode_badge_colors(theme: &base::Theme, mode: EditorMode) -> ModeBadgeColo
             background: hsla(0.38, 0.52, 0.56, 1.0),
             foreground: hsla(0.38, 0.25, 0.08, 1.0),
         },
+        (base::ThemeAppearance::Dark, EditorMode::Command) => ModeBadgeColors {
+            background: hsla(0.10, 0.78, 0.62, 1.0),
+            foreground: hsla(0.10, 0.30, 0.08, 1.0),
+        },
         (base::ThemeAppearance::Light, EditorMode::Normal) => ModeBadgeColors {
             background: hsla(0.60, 0.72, 0.45, 1.0),
             foreground: hsla(0.0, 0.0, 0.98, 1.0),
         },
         (base::ThemeAppearance::Light, EditorMode::Insert) => ModeBadgeColors {
             background: hsla(0.40, 0.58, 0.36, 1.0),
+            foreground: hsla(0.0, 0.0, 0.98, 1.0),
+        },
+        (base::ThemeAppearance::Light, EditorMode::Command) => ModeBadgeColors {
+            background: hsla(0.09, 0.76, 0.44, 1.0),
             foreground: hsla(0.0, 0.0, 0.98, 1.0),
         },
     }
@@ -90,20 +104,18 @@ mod tests {
     }
 
     #[test]
-    fn mode_badge_colors_are_distinct_across_modes_and_appearances() {
-        let mut light = base::Theme::default();
-        light.appearance = base::ThemeAppearance::Light;
+    fn mode_badge_colors_are_distinct_across_all_modes_and_appearances() {
+        for appearance in [base::ThemeAppearance::Light, base::ThemeAppearance::Dark] {
+            let mut theme = base::Theme::default();
+            theme.appearance = appearance;
 
-        let mut dark = base::Theme::default();
-        dark.appearance = base::ThemeAppearance::Dark;
+            let normal = mode_badge_colors(&theme, EditorMode::Normal);
+            let insert = mode_badge_colors(&theme, EditorMode::Insert);
+            let command = mode_badge_colors(&theme, EditorMode::Command);
 
-        assert_ne!(
-            mode_badge_colors(&light, EditorMode::Normal),
-            mode_badge_colors(&light, EditorMode::Insert)
-        );
-        assert_ne!(
-            mode_badge_colors(&dark, EditorMode::Normal),
-            mode_badge_colors(&dark, EditorMode::Insert)
-        );
+            assert_ne!(normal, insert);
+            assert_ne!(normal, command);
+            assert_ne!(insert, command);
+        }
     }
 }

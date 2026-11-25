@@ -13,14 +13,21 @@ use crate::theme;
 
 type ToggleModeHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StatusNotice {
+    Info(SharedString),
+    Error(SharedString),
+}
+
 /// Dead-simple LazyVim-style bottom status bar:
-/// mode box (`INSERT` / `NORMAL`) anchored bottom-left, subtle file/error status beside it,
-/// and reserved open space on the right for future settings.
+/// mode box (`INSERT` / `NORMAL` / `COMMAND`) anchored bottom-left, subtle file/dirty/status
+/// beside it, and reserved open space on the right for future settings.
 #[derive(IntoElement)]
 pub struct StatusBar {
     mode: EditorMode,
     file_name: Option<SharedString>,
-    error_message: Option<SharedString>,
+    is_dirty: bool,
+    notice: Option<StatusNotice>,
     on_toggle_mode: Option<ToggleModeHandler>,
 }
 
@@ -29,7 +36,8 @@ impl StatusBar {
         Self {
             mode,
             file_name: None,
-            error_message: None,
+            is_dirty: false,
+            notice: None,
             on_toggle_mode: None,
         }
     }
@@ -39,8 +47,13 @@ impl StatusBar {
         self
     }
 
-    pub fn error_message(mut self, message: Option<SharedString>) -> Self {
-        self.error_message = message;
+    pub fn dirty(mut self, is_dirty: bool) -> Self {
+        self.is_dirty = is_dirty;
+        self
+    }
+
+    pub fn notice(mut self, notice: Option<StatusNotice>) -> Self {
+        self.notice = notice;
         self
     }
 
@@ -59,6 +72,13 @@ impl RenderOnce for StatusBar {
         let colors = theme.tokens.colors;
         let badge = theme::mode_badge_colors(&theme, self.mode);
         let mono = theme.tokens.typography.mono.clone();
+
+        let file_label = match (self.file_name, self.is_dirty) {
+            (Some(name), true) => Some(SharedString::from(format!("{name} [+]"))),
+            (Some(name), false) => Some(name),
+            (None, true) => Some(SharedString::from("[No Name] [+]")),
+            (None, false) => None,
+        };
 
         div()
             .id("document-status-bar")
@@ -95,24 +115,27 @@ impl RenderOnce for StatusBar {
                             })
                             .child(self.mode.label()),
                     )
-                    .when_some(self.error_message, |this, message| {
+                    .when_some(file_label, |this, label| {
                         this.child(
                             div()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(colors.destructive)
-                                .child(message),
-                        )
-                    })
-                    .when_some(self.file_name, |this, name| {
-                        this.child(
-                            div()
-                                .min_w_0()
-                                .truncate()
+                                .flex_shrink_0()
                                 .text_xs()
                                 .text_color(colors.muted_foreground)
-                                .child(name),
+                                .child(label),
+                        )
+                    })
+                    .when_some(self.notice, |this, notice| {
+                        let (text, color) = match notice {
+                            StatusNotice::Info(msg) => (msg, colors.muted_foreground),
+                            StatusNotice::Error(msg) => (msg, colors.destructive),
+                        };
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(color)
+                                .child(text),
                         )
                     }),
             )
