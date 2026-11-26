@@ -1,5 +1,6 @@
 mod command;
 mod command_bar;
+mod help_overlay;
 mod mode;
 mod scroll_sync;
 mod status_bar;
@@ -16,6 +17,8 @@ actions!(
         NewFile,
         OpenFile,
         SaveFile,
+        Quit,
+        ToggleHelp,
         EnterInsertMode,
         EnterNormalMode,
         OpenCommand,

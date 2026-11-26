@@ -63,7 +63,7 @@ impl RenderOnce for CommandBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = base::Theme::global(cx);
         let colors = theme.tokens.colors;
-        let badge = theme::mode_badge_colors(&theme, EditorMode::Command);
+        let badge = theme::mode_badge_colors(cx, EditorMode::Command);
         let has_hints_panel = !self.hints.items.is_empty() || self.hints.footer.is_some();
         let on_select_hint = self.on_select_hint;
         let selected_ix = self.selected_ix;
@@ -172,7 +172,11 @@ impl RenderOnce for CommandBar {
                                                 div()
                                                     .min_w_0()
                                                     .truncate()
-                                                    .text_color(colors.muted_foreground)
+                                                    .text_color(if is_selected {
+                                                        colors.accent_foreground.alpha(0.85)
+                                                    } else {
+                                                        colors.muted_foreground
+                                                    })
                                                     .child(hint.description),
                                             )
                                     },

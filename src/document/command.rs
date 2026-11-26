@@ -1,5 +1,7 @@
 use gpui_kit::SharedString;
 
+use crate::theme::{ThemePreference, ThemePreset};
+
 /// Maximum number of hint rows shown below the command box at once.
 pub const MAX_VISIBLE_HINTS: usize = 10;
 
@@ -13,6 +15,7 @@ pub enum Command {
     WriteQuit { path: Option<String> },
     Open { path: Option<String> },
     SetFont { name: Option<String> },
+    SetTheme { name: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +98,13 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "Change document font (system fonts or default)",
         insert_text: "Font ",
     },
+    CommandSpec {
+        name: "Theme",
+        aliases: &["theme"],
+        label: "Theme <name>",
+        description: "Change color theme (auto, dark, light, or preset)",
+        insert_text: "Theme ",
+    },
 ];
 
 pub fn parse_command(raw: &str) -> Result<Command, String> {
@@ -114,6 +124,9 @@ pub fn parse_command(raw: &str) -> Result<Command, String> {
     if name.eq_ignore_ascii_case("font") {
         return Ok(Command::SetFont { name: arg });
     }
+    if name.eq_ignore_ascii_case("theme") {
+        return Ok(Command::SetTheme { name: arg });
+    }
 
     match name {
         "n" | "new" | "enew" => ensure_no_arg(name, arg, Command::New { force: false }),
@@ -127,11 +140,12 @@ pub fn parse_command(raw: &str) -> Result<Command, String> {
     }
 }
 
-/// Typing `:Font ` switches hints into a live-filtered list of installed system fonts.
+/// Typing `:Font ` or `:Theme ` switches hints into a live-filtered picker.
 pub fn command_hints(
     raw: &str,
     available_fonts: &[SharedString],
     current_font: Option<&str>,
+    current_theme: ThemePreference,
 ) -> HintList {
     let input = raw.trim_start().trim_start_matches(':').trim_start();
     if input.is_empty() {
@@ -144,6 +158,9 @@ pub fn command_hints(
     if let Some((head, tail)) = input.split_once(char::is_whitespace) {
         if head.eq_ignore_ascii_case("font") {
             return font_hints(tail.trim(), available_fonts, current_font);
+        }
+        if head.eq_ignore_ascii_case("theme") {
+            return theme_hints(tail.trim(), current_theme);
         }
         return active_command_arg_hint(head, tail.trim());
     }
@@ -207,6 +224,39 @@ pub fn resolve_font_name(
     }
 
     Err(format!("Font not found: {query}"))
+}
+
+/// Resolves a requested `:Theme` name case-insensitively (`auto`/`default`/`system` or a preset).
+pub fn resolve_theme_name(requested: &str) -> Result<ThemePreference, String> {
+    let query = requested.trim();
+    if query.eq_ignore_ascii_case("auto")
+        || query.eq_ignore_ascii_case("default")
+        || query.eq_ignore_ascii_case("system")
+        || query.eq_ignore_ascii_case("omarchy")
+    {
+        return Ok(ThemePreference::Auto);
+    }
+
+    if let Some(exact) = ThemePreset::ALL
+        .iter()
+        .copied()
+        .find(|preset| preset.id().eq_ignore_ascii_case(query))
+    {
+        return Ok(ThemePreference::Preset(exact));
+    }
+
+    let query_lower = query.to_ascii_lowercase();
+    let mut prefix_matches = ThemePreset::ALL
+        .iter()
+        .copied()
+        .filter(|preset| preset.id().starts_with(&query_lower));
+    if let Some(first) = prefix_matches.next()
+        && prefix_matches.next().is_none()
+    {
+        return Ok(ThemePreference::Preset(first));
+    }
+
+    Err(format!("Theme not found: {query}"))
 }
 
 fn spec_to_hint(spec: &CommandSpec) -> CommandHint {
@@ -331,6 +381,51 @@ fn font_hints(
     HintList { items, footer }
 }
 
+fn theme_hints(query: &str, current_theme: ThemePreference) -> HintList {
+    let query_lower = query.to_ascii_lowercase();
+    let mut items = Vec::new();
+
+    if query_lower.is_empty()
+        || "auto".contains(&query_lower)
+        || "system".contains(&query_lower)
+        || "omarchy".contains(&query_lower)
+    {
+        items.push(CommandHint {
+            label: SharedString::from("auto"),
+            description: SharedString::from(if current_theme == ThemePreference::Auto {
+                "Follow Omarchy / soft dark fallback (active)"
+            } else {
+                "Follow Omarchy / soft dark fallback"
+            }),
+            insert_text: SharedString::from("Theme auto"),
+        });
+    }
+
+    for &preset in ThemePreset::ALL {
+        let id = preset.id();
+        if !query_lower.is_empty() && !id.contains(&query_lower) {
+            continue;
+        }
+        let is_active = current_theme == ThemePreference::Preset(preset);
+        let description = if is_active {
+            format!("{} (active)", preset.description())
+        } else {
+            preset.description().to_string()
+        };
+        items.push(CommandHint {
+            label: SharedString::from(id),
+            description: SharedString::from(description),
+            insert_text: SharedString::from(format!("Theme {id}")),
+        });
+    }
+
+    let footer = items
+        .is_empty()
+        .then(|| SharedString::from("No matching themes"));
+
+    HintList { items, footer }
+}
+
 fn ensure_no_arg(name: &str, arg: Option<String>, cmd: Command) -> Result<Command, String> {
     if arg.is_some() {
         Err(format!(":{name} does not take arguments"))
@@ -341,7 +436,8 @@ fn ensure_no_arg(name: &str, arg: Option<String>, cmd: Command) -> Result<Comman
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, command_hints, parse_command, resolve_font_name};
+    use super::{Command, command_hints, parse_command, resolve_font_name, resolve_theme_name};
+    use crate::theme::{ThemePreference, ThemePreset};
     use gpui_kit::SharedString;
 
     fn sample_fonts() -> Vec<SharedString> {
@@ -393,6 +489,13 @@ mod tests {
                 name: Some("JetBrains Mono".to_string())
             })
         );
+        assert_eq!(parse_command("Theme"), Ok(Command::SetTheme { name: None }));
+        assert_eq!(
+            parse_command("theme light"),
+            Ok(Command::SetTheme {
+                name: Some("light".to_string())
+            })
+        );
     }
 
     #[test]
@@ -406,13 +509,13 @@ mod tests {
     #[test]
     fn command_hints_filter_w_and_n_with_english_descriptions() {
         let fonts = sample_fonts();
-        let w_hints = command_hints("w", &fonts, None);
+        let w_hints = command_hints("w", &fonts, None, ThemePreference::Auto);
         let w_labels: Vec<&str> = w_hints.items.iter().map(|h| h.label.as_ref()).collect();
         assert_eq!(w_labels, vec!["w [path]", "wq [path]"]);
         assert!(w_hints.items[0].description.contains("Save"));
         assert!(w_hints.items[1].description.contains("quit"));
 
-        let n_hints = command_hints("n", &fonts, None);
+        let n_hints = command_hints("n", &fonts, None, ThemePreference::Auto);
         let n_labels: Vec<&str> = n_hints.items.iter().map(|h| h.label.as_ref()).collect();
         assert_eq!(n_labels, vec!["n", "n!"]);
     }
@@ -420,7 +523,7 @@ mod tests {
     #[test]
     fn font_hints_filter_installed_fonts_and_mark_active_font() {
         let fonts = sample_fonts();
-        let all = command_hints("Font ", &fonts, Some("Inter"));
+        let all = command_hints("Font ", &fonts, Some("Inter"), ThemePreference::Auto);
         assert_eq!(all.items[0].label.as_ref(), "default");
         assert!(
             all.items
@@ -428,9 +531,42 @@ mod tests {
                 .any(|h| h.label.as_ref() == "Inter" && h.description.contains("Active"))
         );
 
-        let filtered = command_hints("font noto", &fonts, None);
+        let filtered = command_hints("font noto", &fonts, None, ThemePreference::Auto);
         let labels: Vec<&str> = filtered.items.iter().map(|h| h.label.as_ref()).collect();
         assert_eq!(labels, vec!["Noto Sans", "Noto Serif"]);
+    }
+
+    #[test]
+    fn theme_hints_and_resolver_support_auto_and_presets() {
+        let fonts = sample_fonts();
+        let all = command_hints(
+            "Theme ",
+            &fonts,
+            None,
+            ThemePreference::Preset(ThemePreset::Light),
+        );
+        assert_eq!(all.items[0].label.as_ref(), "auto");
+        assert!(
+            all.items
+                .iter()
+                .any(|h| h.label.as_ref() == "light" && h.description.contains("(active)"))
+        );
+
+        let filtered = command_hints("theme cat", &fonts, None, ThemePreference::Auto);
+        let labels: Vec<&str> = filtered.items.iter().map(|h| h.label.as_ref()).collect();
+        assert_eq!(labels, vec!["catppuccin"]);
+
+        assert_eq!(resolve_theme_name("auto"), Ok(ThemePreference::Auto));
+        assert_eq!(resolve_theme_name("default"), Ok(ThemePreference::Auto));
+        assert_eq!(
+            resolve_theme_name("light"),
+            Ok(ThemePreference::Preset(ThemePreset::Light))
+        );
+        assert_eq!(
+            resolve_theme_name("tok"),
+            Ok(ThemePreference::Preset(ThemePreset::TokyoNight))
+        );
+        assert!(resolve_theme_name("nonexistent").is_err());
     }
 
     #[test]

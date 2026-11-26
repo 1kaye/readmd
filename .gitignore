@@ -1,4 +1,7 @@
 /target
+/pkgbuild/pkg/
+/pkgbuild/src/
+*.pkg.tar.*
 .cargo/
 .kaye/
 .agents/plugins/kaye/

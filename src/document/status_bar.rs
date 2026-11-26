@@ -91,7 +91,7 @@ impl RenderOnce for StatusBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = base::Theme::global(cx);
         let colors = theme.tokens.colors;
-        let badge = theme::mode_badge_colors(&theme, self.mode);
+        let badge = theme::mode_badge_colors(cx, self.mode);
 
         let file_label = match (self.file_name, self.is_dirty) {
             (Some(name), true) => Some(SharedString::from(format!("{name} [+]"))),

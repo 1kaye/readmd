@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT"
+cargo build --release
+
+TARGET_DIR="$(cargo metadata --no-deps --offline --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+echo "Built ${TARGET_DIR:-$ROOT/target}/release/readmd"

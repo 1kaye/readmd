@@ -72,7 +72,33 @@ pub fn save_markdown_file(path: &Path, content: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
     }
-    std::fs::write(path, content).map_err(|err| format!("Failed to save {}: {err}", path.display()))
+    write_file_atomic(path, content)
+        .map_err(|err| format!("Failed to save {}: {err}", path.display()))
+}
+
+/// Atomic file write: writes to a sibling temporary file in the same directory
+/// and renames it into place so partial writes never corrupt the target file.
+pub fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(".{file_name}.readmd-tmp-{}-{seq}", std::process::id());
+    let tmp_path = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => parent.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    };
+
+    if let Err(err) = std::fs::write(&tmp_path, content) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
 }
 
 pub fn expand_user_path(raw: &str, base_dir: Option<&Path>) -> PathBuf {

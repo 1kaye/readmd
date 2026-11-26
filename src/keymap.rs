@@ -5,7 +5,7 @@ use gpui_kit::{Action, App, Global, KeyBinding, KeyBindingContextPredicate};
 
 use crate::document::{
     CommandCompleteHint, CommandNextHint, CommandPrevHint, EnterInsertMode, EnterNormalMode,
-    NewFile, OpenCommand, OpenFile, SaveFile, ScrollDown, ScrollUp,
+    NewFile, OpenCommand, OpenFile, Quit, SaveFile, ScrollDown, ScrollUp, ToggleHelp,
 };
 
 const WORKSPACE_CONTEXT: &str = "DocumentWorkspace";
@@ -25,6 +25,8 @@ pub const DEFAULT_KEYMAPS_TOML: &str = "\
 new_file = \"secondary-n\"
 open_file = \"secondary-o\"
 save_file = \"secondary-s\"
+quit = \"ctrl-q\"
+toggle_help = \"shift-/\"
 enter_insert = \"i\"
 enter_normal = \"escape\"
 open_command = \":\"
@@ -37,6 +39,8 @@ pub struct KeymapConfig {
     pub new_file: Vec<String>,
     pub open_file: Vec<String>,
     pub save_file: Vec<String>,
+    pub quit: Vec<String>,
+    pub toggle_help: Vec<String>,
     pub enter_insert: Vec<String>,
     pub enter_normal: Vec<String>,
     pub open_command: Vec<String>,
@@ -50,6 +54,8 @@ impl Default for KeymapConfig {
             new_file: vec!["secondary-n".to_string()],
             open_file: vec!["secondary-o".to_string()],
             save_file: vec!["secondary-s".to_string()],
+            quit: vec!["ctrl-q".to_string()],
+            toggle_help: vec!["shift-/".to_string()],
             enter_insert: vec!["i".to_string()],
             enter_normal: vec!["escape".to_string()],
             open_command: vec![":".to_string()],
@@ -191,8 +197,13 @@ fn write_default_config(path: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
     }
-    std::fs::write(path, DEFAULT_KEYMAPS_TOML)
-        .map_err(|err| format!("Failed to write {}: {err}", path.display()))
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, DEFAULT_KEYMAPS_TOML)
+        .map_err(|err| format!("Failed to write {}: {err}", path.display()))?;
+    std::fs::rename(&tmp, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Failed to write {}: {err}", path.display())
+    })
 }
 
 fn apply_bindings(
@@ -231,6 +242,20 @@ fn apply_bindings(
     )?;
     push_bindings(
         &mut app_bindings,
+        &config.quit,
+        || Box::new(Quit),
+        &workspace_ctx,
+        cx,
+    )?;
+    push_bindings(
+        &mut app_bindings,
+        &config.toggle_help,
+        || Box::new(ToggleHelp),
+        &normal_ctx,
+        cx,
+    )?;
+    push_bindings(
+        &mut app_bindings,
         &config.enter_insert,
         || Box::new(EnterInsertMode),
         &normal_ctx,
@@ -257,6 +282,17 @@ fn apply_bindings(
         &normal_ctx,
         cx,
     )?;
+    app_bindings.push(
+        KeyBinding::load(
+            "escape",
+            Box::new(EnterNormalMode),
+            Some(normal_ctx),
+            false,
+            None,
+            cx,
+        )
+        .map_err(|err| format!("Invalid keybinding 'escape': {err}"))?,
+    );
 
     // Command bar navigation and completion (supersedes single-line Input up/down/tab).
     for ctx in [&command_ctx, &command_input_ctx] {
@@ -367,6 +403,8 @@ pub fn parse_keymaps_toml(source: &str) -> Result<KeymapConfig, String> {
             "new_file" => config.new_file = values,
             "open_file" => config.open_file = values,
             "save_file" => config.save_file = values,
+            "quit" => config.quit = values,
+            "toggle_help" => config.toggle_help = values,
             "enter_insert" => config.enter_insert = values,
             "enter_normal" => config.enter_normal = values,
             "open_command" => config.open_command = values,

@@ -12,8 +12,11 @@ use gpui_kit::{
     rems,
 };
 
-use super::command::{Command, HintList, command_hints, parse_command, resolve_font_name};
+use super::command::{
+    Command, HintList, command_hints, parse_command, resolve_font_name, resolve_theme_name,
+};
 use super::command_bar::CommandBar;
+use super::help_overlay::HelpOverlay;
 use super::mode::{
     EditorMode, expand_user_path, file_display_name, load_markdown_file, save_markdown_file,
     select_dropped_markdown, window_title_for_state,
@@ -27,12 +30,13 @@ use super::scroll_sync::{
 use super::status_bar::{StatusBar, StatusNotice};
 use super::{
     CommandCompleteHint, CommandNextHint, CommandPrevHint, EnterInsertMode, EnterNormalMode,
-    NewFile, OpenCommand, OpenFile, SaveFile, ScrollDown, ScrollUp,
+    NewFile, OpenCommand, OpenFile, Quit, SaveFile, ScrollDown, ScrollUp, ToggleHelp,
 };
 use crate::{keymap, theme};
 
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(3);
 const NORMAL_SCROLL_STEP_REMS: f32 = 3.0;
+const THEME_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Copy)]
 enum PendingEditorSync {
@@ -66,6 +70,7 @@ pub struct DocumentWorkspace {
     document_font: Option<SharedString>,
     available_fonts: Vec<SharedString>,
     selected_hint_ix: Option<usize>,
+    help_open: bool,
     pending_editor_sync: Option<PendingEditorSync>,
     pending_preview_sync: Option<PendingPreviewSync>,
     reveal_anchor_ratio: f64,
@@ -77,22 +82,24 @@ pub struct DocumentWorkspace {
     io_in_flight: bool,
     request_id: u64,
     _io_task: Option<Task<()>>,
+    _theme_watcher: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl DocumentWorkspace {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(initial_path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let initial_theme = base::Theme::global(cx);
         let editor_style = theme::editor_style(&initial_theme);
+        let command_style = theme::command_input_style(&initial_theme);
 
         let editor = cx.new(|cx| {
             let mut state = base::input::TextareaState::new(window, cx);
-            state.set_editor_style(editor_style.clone());
+            state.set_editor_style(editor_style);
             state
         });
         let command_input = cx.new(|cx| {
             let mut state = base::input::InputState::new(window, cx);
-            state.set_editor_style(editor_style);
+            state.set_editor_style(command_style);
             state
         });
         let preview = cx.new(|cx| base::TextViewState::markdown("", cx));
@@ -106,15 +113,40 @@ impl DocumentWorkspace {
         let weak_editor = editor.downgrade();
         let weak_command = command_input.downgrade();
         let appearance_sub = window.observe_window_appearance(move |window, cx| {
-            theme::sync_with_appearance(window.appearance(), cx);
-            let updated_style = theme::editor_style(&base::Theme::global(cx));
-            let _ = weak_editor.update(cx, |state, _| {
-                state.set_editor_style(updated_style.clone());
-            });
-            let _ = weak_command.update(cx, |state, _| {
-                state.set_editor_style(updated_style);
-            });
-            window.refresh();
+            if theme::sync_with_system(cx) {
+                let current_theme = base::Theme::global(cx);
+                let updated_editor = theme::editor_style(&current_theme);
+                let updated_command = theme::command_input_style(&current_theme);
+                let _ = weak_editor.update(cx, |state, _| {
+                    state.set_editor_style(updated_editor);
+                });
+                let _ = weak_command.update(cx, |state, _| {
+                    state.set_editor_style(updated_command);
+                });
+                window.refresh();
+            }
+        });
+
+        let theme_watcher = cx.spawn_in(window, async move |weak_this, cx| {
+            loop {
+                cx.background_executor().timer(THEME_POLL_INTERVAL).await;
+                let snapshot = cx
+                    .background_executor()
+                    .spawn(async { theme::load_system_theme() })
+                    .await;
+                let alive = weak_this
+                    .update_in(cx, |this, window, cx| {
+                        if theme::apply_system_palette_if_changed(snapshot.palette, cx) {
+                            this.sync_input_styles(cx);
+                            window.refresh();
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
         });
 
         let editor_change_sub = cx.subscribe_in(
@@ -169,6 +201,7 @@ impl DocumentWorkspace {
             document_font: None,
             available_fonts,
             selected_hint_ix: None,
+            help_open: false,
             pending_editor_sync: None,
             pending_preview_sync: None,
             reveal_anchor_ratio: 0.0,
@@ -180,6 +213,7 @@ impl DocumentWorkspace {
             io_in_flight: false,
             request_id: 0,
             _io_task: None,
+            _theme_watcher: theme_watcher,
             _subscriptions: vec![
                 appearance_sub,
                 editor_change_sub,
@@ -192,7 +226,23 @@ impl DocumentWorkspace {
             this.show_notice(StatusNotice::Error(SharedString::from(msg)), cx);
         }
 
+        if let Some(path) = initial_path {
+            this.load_file_from_path(path, EditorMode::on_file_loaded(), window, cx);
+        }
+
         this
+    }
+
+    fn sync_input_styles(&self, cx: &mut Context<Self>) {
+        let current_theme = base::Theme::global(cx);
+        let updated_editor = theme::editor_style(&current_theme);
+        let updated_command = theme::command_input_style(&current_theme);
+        self.editor.update(cx, |state, _| {
+            state.set_editor_style(updated_editor);
+        });
+        self.command_input.update(cx, |state, _| {
+            state.set_editor_style(updated_command);
+        });
     }
 
     fn show_notice(&mut self, notice: StatusNotice, cx: &mut Context<Self>) {
@@ -230,7 +280,12 @@ impl DocumentWorkspace {
 
     fn current_command_hints(&self, cx: &Context<Self>) -> HintList {
         let raw = self.command_input.read(cx).value();
-        command_hints(&raw, &self.available_fonts, self.document_font.as_deref())
+        command_hints(
+            &raw,
+            &self.available_fonts,
+            self.document_font.as_deref(),
+            theme::active_preference(cx),
+        )
     }
 
     fn set_command_input_text(
@@ -526,6 +581,7 @@ impl DocumentWorkspace {
         if self.mode != EditorMode::Normal {
             return;
         }
+        self.help_open = false;
         self.clear_notice();
         self.selected_hint_ix = None;
         self.mode = EditorMode::Command;
@@ -713,6 +769,28 @@ impl DocumentWorkspace {
                 }
             }
             Ok(Command::SetFont { name: None }) => cx.notify(),
+            Ok(Command::SetTheme { name: Some(name) }) => match resolve_theme_name(&name) {
+                Ok(preference) => {
+                    theme::set_preference(preference, cx);
+                    self.sync_input_styles(cx);
+                    let label = match preference {
+                        theme::ThemePreference::Auto => {
+                            "Theme set to auto (system / Omarchy)".to_string()
+                        }
+                        theme::ThemePreference::Preset(preset) => {
+                            format!("Theme set to {}", preset.id())
+                        }
+                    };
+                    self.show_notice(StatusNotice::Info(SharedString::from(label)), cx);
+                    window.refresh();
+                    cx.notify();
+                }
+                Err(err) => {
+                    self.show_notice(StatusNotice::Error(err.into()), cx);
+                    cx.notify();
+                }
+            },
+            Ok(Command::SetTheme { name: None }) => cx.notify(),
             Err(err) => {
                 self.show_notice(StatusNotice::Error(err.into()), cx);
                 cx.notify();
@@ -740,6 +818,7 @@ impl DocumentWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.help_open = false;
         self.enter_insert_mode(window, cx);
     }
 
@@ -749,7 +828,45 @@ impl DocumentWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.help_open {
+            self.close_help(window, cx);
+            return;
+        }
         self.enter_normal_mode(window, cx);
+    }
+
+    fn on_toggle_help(&mut self, _: &ToggleHelp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != EditorMode::Normal {
+            return;
+        }
+        self.help_open = !self.help_open;
+        if !self.help_open {
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn close_help(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.help_open {
+            return;
+        }
+        self.help_open = false;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dirty {
+            self.show_notice(
+                StatusNotice::Error(SharedString::from(
+                    "No write since last change (save first or use :q! to override)",
+                )),
+                cx,
+            );
+            cx.notify();
+        } else {
+            window.remove_window();
+        }
     }
 
     fn on_open_command(&mut self, _: &OpenCommand, window: &mut Window, cx: &mut Context<Self>) {
@@ -1246,7 +1363,12 @@ impl Render for DocumentWorkspace {
 
         let command_hints = (self.mode == EditorMode::Command).then(|| {
             let raw = self.command_input.read(cx).value();
-            command_hints(&raw, &self.available_fonts, self.document_font.as_deref())
+            command_hints(
+                &raw,
+                &self.available_fonts,
+                self.document_font.as_deref(),
+                theme::active_preference(cx),
+            )
         });
 
         div()
@@ -1256,6 +1378,8 @@ impl Render for DocumentWorkspace {
             .on_action(cx.listener(Self::on_new_file))
             .on_action(cx.listener(Self::on_open_file))
             .on_action(cx.listener(Self::on_save_file))
+            .on_action(cx.listener(Self::on_quit))
+            .on_action(cx.listener(Self::on_toggle_help))
             .on_action(cx.listener(Self::on_enter_insert_mode))
             .on_action(cx.listener(Self::on_enter_normal_mode))
             .on_action(cx.listener(Self::on_open_command))
@@ -1290,6 +1414,13 @@ impl Render for DocumentWorkspace {
                                 this.select_hint(insert_text, window, cx);
                             });
                         }),
+                )
+            })
+            .when(self.help_open, |this| {
+                this.child(
+                    HelpOverlay::new().on_dismiss(cx.listener(|this, _, window, cx| {
+                        this.close_help(window, cx);
+                    })),
                 )
             })
     }

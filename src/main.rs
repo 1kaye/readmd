@@ -2,7 +2,11 @@ mod document;
 mod keymap;
 mod theme;
 
-use gpui_kit::{AppContext as _, Bounds, Pixels, WindowBounds, WindowOptions, px, size};
+use std::path::PathBuf;
+
+use gpui_kit::{
+    AppContext as _, Bounds, Pixels, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+};
 
 // Physical window sizing exceptions (platform window geometry, not UI layout).
 const INITIAL_WINDOW_WIDTH: Pixels = px(960.);
@@ -11,9 +15,12 @@ const MIN_WINDOW_WIDTH: Pixels = px(360.);
 const MIN_WINDOW_HEIGHT: Pixels = px(240.);
 
 fn main() {
-    gpui_kit::application().run(|cx| {
-        gpui_kit::init(cx);
+    let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
+
+    gpui_kit::application().run(move |cx| {
+        gpui_kit::base::init(cx);
         theme::load_app_fonts(cx);
+        theme::init(cx);
         keymap::init(cx);
 
         cx.on_window_closed(|cx, _| {
@@ -30,15 +37,20 @@ fn main() {
                 cx,
             ))),
             window_min_size: Some(size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)),
-            app_id: Some(document::APP_TITLE.to_string()),
+            titlebar: Some(TitlebarOptions {
+                title: Some(document::APP_TITLE.into()),
+                ..Default::default()
+            }),
+            // Matches StartupWMClass=readmd in readmd.desktop on Wayland/Hyprland.
+            app_id: Some(document::APP_TITLE.into()),
             ..WindowOptions::default()
         };
 
         gpui_kit::open_window(options, cx, |window, cx| {
             window.set_window_title(document::APP_TITLE);
-            theme::sync_with_appearance(window.appearance(), cx);
-            cx.new(|cx| document::DocumentWorkspace::new(window, cx))
+            cx.new(|cx| document::DocumentWorkspace::new(initial_path.clone(), window, cx))
         })
         .expect("Failed to open readmd window");
+        cx.activate(true);
     });
 }

@@ -1,0 +1,29 @@
+# Maintainer: 1kaye
+pkgname=readmd
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Keyboard-first Markdown reader and editor built with GPUI'
+arch=('x86_64' 'aarch64')
+url='https://github.com/1kaye/readmd'
+license=('MIT')
+depends=('wayland' 'libxkbcommon' 'vulkan-icd-loader' 'fontconfig' 'freetype2' 'xdg-desktop-portal')
+makedepends=('rust' 'cargo')
+options=('!debug' '!lto')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  unset RUSTFLAGS CFLAGS CXXFLAGS LDFLAGS
+  ./bin/build
+}
+
+package() {
+  cd "$startdir/.."
+  local target_dir
+  target_dir="$(cargo metadata --no-deps --offline --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+  install -Dm755 "$target_dir/release/readmd" "$pkgdir/usr/bin/readmd"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$startdir/readmd.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/readmd.svg"
+  install -Dm644 "$startdir/readmd.desktop" "$pkgdir/usr/share/applications/readmd.desktop"
+}

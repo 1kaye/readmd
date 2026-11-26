@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=readmd
+Comment=Keyboard-first Markdown reader and editor built with GPUI
+Exec=readmd %f
+Icon=readmd
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;
+StartupWMClass=readmd
