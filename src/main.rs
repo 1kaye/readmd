@@ -13,6 +13,7 @@ const MIN_WINDOW_HEIGHT: Pixels = px(240.);
 fn main() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
+        theme::load_app_fonts(cx);
         keymap::init(cx);
 
         cx.on_window_closed(|cx, _| {

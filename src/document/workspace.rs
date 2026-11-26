@@ -2,26 +2,55 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, base, div, point,
-    prelude::FluentBuilder as _, rems,
+    AppContext as _, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable as _,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    Window,
+    base::{self, ElementExt as _},
+    div, point,
+    prelude::FluentBuilder as _,
+    rems,
 };
 
 use super::command::{Command, HintList, command_hints, parse_command, resolve_font_name};
 use super::command_bar::CommandBar;
 use super::mode::{
     EditorMode, expand_user_path, file_display_name, load_markdown_file, save_markdown_file,
-    window_title_for_state,
+    select_dropped_markdown, window_title_for_state,
+};
+use super::scroll_sync::{
+    anchor_line_for_editor_viewport, byte_offset_to_position, clamp_scroll_offset,
+    editor_max_scroll_y, find_rendered_anchor_range, map_editor_ratio_to_preview_ratio,
+    map_preview_ratio_to_editor_ratio, needs_scroll_adjustment, reveal_scroll_target_y,
+    scroll_ratio, target_cursor_line_for_viewport, target_scroll_y,
 };
 use super::status_bar::{StatusBar, StatusNotice};
 use super::{
     CommandCompleteHint, CommandNextHint, CommandPrevHint, EnterInsertMode, EnterNormalMode,
-    OpenCommand, OpenFile, SaveFile,
+    NewFile, OpenCommand, OpenFile, SaveFile, ScrollDown, ScrollUp,
 };
 use crate::{keymap, theme};
 
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(3);
+const NORMAL_SCROLL_STEP_REMS: f32 = 3.0;
+
+#[derive(Clone, Copy)]
+enum PendingEditorSync {
+    ApplyScroll {
+        ratio: f64,
+        source_byte: Option<usize>,
+    },
+    AlignCursor {
+        target_y: f64,
+        ratio: f64,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct PendingPreviewSync {
+    ratio: f64,
+    anchor_line: usize,
+}
 
 /// Retained workspace owning the active Markdown buffer, modal state,
 /// plain-text editor, rendered preview, top-center command line, font state,
@@ -37,6 +66,9 @@ pub struct DocumentWorkspace {
     document_font: Option<SharedString>,
     available_fonts: Vec<SharedString>,
     selected_hint_ix: Option<usize>,
+    pending_editor_sync: Option<PendingEditorSync>,
+    pending_preview_sync: Option<PendingPreviewSync>,
+    reveal_anchor_ratio: f64,
     editor: Entity<base::input::TextareaState>,
     preview: Entity<base::TextViewState>,
     command_input: Entity<base::input::InputState>,
@@ -118,6 +150,12 @@ impl DocumentWorkspace {
             },
         );
 
+        let preview_parse_sub = cx.observe(&preview, |this, _, cx| {
+            if this.mode == EditorMode::Normal && this.pending_preview_sync.is_some() {
+                cx.notify();
+            }
+        });
+
         let startup_notice = keymap::take_startup_notice(cx);
 
         let mut this = Self {
@@ -131,6 +169,9 @@ impl DocumentWorkspace {
             document_font: None,
             available_fonts,
             selected_hint_ix: None,
+            pending_editor_sync: None,
+            pending_preview_sync: None,
+            reveal_anchor_ratio: 0.0,
             editor,
             preview,
             command_input,
@@ -139,7 +180,12 @@ impl DocumentWorkspace {
             io_in_flight: false,
             request_id: 0,
             _io_task: None,
-            _subscriptions: vec![appearance_sub, editor_change_sub, command_event_sub],
+            _subscriptions: vec![
+                appearance_sub,
+                editor_change_sub,
+                command_event_sub,
+                preview_parse_sub,
+            ],
         };
 
         if let Some(msg) = startup_notice {
@@ -203,6 +249,198 @@ impl DocumentWorkspace {
         cx.notify();
     }
 
+    fn preview_scroll_ratio(&self) -> f64 {
+        let offset_y = f64::from(f32::from(self.scroll_handle.offset().y));
+        let max_y = f64::from(f32::from(self.scroll_handle.max_offset().y));
+        scroll_ratio(offset_y, max_y)
+    }
+
+    fn editor_scroll_ratio(&self, cx: &Context<Self>) -> f64 {
+        let editor = self.editor.read(cx);
+        let max_y = editor_max_scroll_y(
+            editor.content_height_f64(),
+            f64::from(f32::from(editor.input_bounds().size.height)),
+        );
+        scroll_ratio(editor.scroll_y_f64(), max_y)
+    }
+
+    fn apply_scroll_ratio_to_editor(&self, ratio: f64, cx: &mut Context<Self>) {
+        let max_y = {
+            let editor = self.editor.read(cx);
+            editor_max_scroll_y(
+                editor.content_height_f64(),
+                f64::from(f32::from(editor.input_bounds().size.height)),
+            )
+        };
+        if max_y > 0.0 {
+            let target_y = target_scroll_y(ratio, max_y);
+            self.editor
+                .update(cx, |editor, cx| editor.set_scroll_y_f64(target_y, cx));
+        }
+    }
+
+    fn apply_scroll_ratio_to_preview(&self, ratio: f64) {
+        let max_y = f64::from(f32::from(self.scroll_handle.max_offset().y));
+        if max_y > 0.0 {
+            let target_y = target_scroll_y(ratio, max_y) as f32;
+            self.scroll_handle
+                .set_offset(point(Pixels::ZERO, gpui_kit::px(target_y)));
+        }
+    }
+
+    fn align_editor_cursor_to_viewport(
+        &self,
+        ratio: f64,
+        target_y: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (visible, cursor_line, current_y, max_y) = {
+            let editor = self.editor.read(cx);
+            (
+                editor.visible_row_range(),
+                editor.cursor_position().line as usize,
+                editor.scroll_y_f64(),
+                editor_max_scroll_y(
+                    editor.content_height_f64(),
+                    f64::from(f32::from(editor.input_bounds().size.height)),
+                ),
+            )
+        };
+        if let Some(visible) = visible
+            && let Some(target_line) =
+                target_cursor_line_for_viewport(visible, cursor_line, ratio, current_y, max_y)
+        {
+            self.editor.update(cx, |editor, cx| {
+                editor.set_cursor_position(
+                    base::input::Position::new(target_line as u32, 0),
+                    window,
+                    cx,
+                );
+                editor.set_scroll_y_f64(target_y, cx);
+            });
+            window.refresh();
+        }
+    }
+
+    fn sync_pending_editor_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != EditorMode::Insert {
+            self.pending_editor_sync = None;
+            return;
+        }
+        let (content_height, viewport_height, current_y) = {
+            let editor = self.editor.read(cx);
+            (
+                editor.content_height_f64(),
+                f64::from(f32::from(editor.input_bounds().size.height)),
+                editor.scroll_y_f64(),
+            )
+        };
+        if viewport_height <= 0.0 {
+            return;
+        }
+        let Some(pending) = self.pending_editor_sync.take() else {
+            return;
+        };
+        let max_y = editor_max_scroll_y(content_height, viewport_height);
+
+        match pending {
+            PendingEditorSync::ApplyScroll { ratio, source_byte } => {
+                if let Some(byte_offset) = source_byte {
+                    let pos = {
+                        let source = self.editor.read(cx).value();
+                        byte_offset_to_position(&source, byte_offset)
+                    };
+                    self.editor.update(cx, |editor, cx| {
+                        editor.set_cursor_position(pos, window, cx);
+                    });
+                    window.refresh();
+                    return;
+                }
+
+                let target_y = target_scroll_y(ratio, max_y);
+                if needs_scroll_adjustment(current_y, target_y) {
+                    self.editor
+                        .update(cx, |editor, cx| editor.set_scroll_y_f64(target_y, cx));
+                    self.pending_editor_sync =
+                        Some(PendingEditorSync::AlignCursor { target_y, ratio });
+                    window.refresh();
+                } else {
+                    self.align_editor_cursor_to_viewport(ratio, target_y, window, cx);
+                }
+            }
+            PendingEditorSync::AlignCursor { target_y, ratio } => {
+                self.align_editor_cursor_to_viewport(ratio, target_y, window, cx);
+            }
+        }
+    }
+
+    fn sync_pending_preview_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != EditorMode::Normal {
+            self.pending_preview_sync = None;
+            return;
+        }
+        let viewport_height = f64::from(f32::from(self.scroll_handle.bounds().size.height));
+        if viewport_height <= 0.0 {
+            return;
+        }
+        let Some(sync) = self.pending_preview_sync.take() else {
+            return;
+        };
+        let max_y = f64::from(f32::from(self.scroll_handle.max_offset().y));
+        let current_y = f64::from(f32::from(self.scroll_handle.offset().y));
+        let target_y = target_scroll_y(sync.ratio, max_y);
+        if needs_scroll_adjustment(current_y, target_y) {
+            self.scroll_handle
+                .set_offset(point(Pixels::ZERO, gpui_kit::px(target_y as f32)));
+            window.refresh();
+        }
+
+        if sync.anchor_line > 0 && max_y > 0.0 {
+            let source = self.editor.read(cx).value();
+            let rendered = self.preview.read(cx).rendered_text();
+            if rendered.source() != source.as_ref() {
+                // Large Markdown parse is still running on the background parser;
+                // retry once `preview_parse_sub` notifies on completion.
+                self.pending_preview_sync = Some(sync);
+                return;
+            }
+            if let Some(range) = find_rendered_anchor_range(&rendered, sync.anchor_line) {
+                self.reveal_anchor_ratio = sync.ratio;
+                _ = self.preview.update(cx, |preview, cx| {
+                    preview.reveal_range(range.start..range.start, cx)
+                });
+            }
+        }
+    }
+
+    fn handle_preview_reveal(&mut self, line_bounds: Bounds<Pixels>, window: &mut Window) {
+        if self.mode != EditorMode::Normal {
+            return;
+        }
+        let viewport = self.scroll_handle.bounds();
+        if viewport.size.height <= Pixels::ZERO {
+            return;
+        }
+        let current = self.scroll_handle.offset();
+        let max_y = self.scroll_handle.max_offset().y;
+        let next_y = reveal_scroll_target_y(
+            line_bounds,
+            viewport,
+            current.y,
+            max_y,
+            self.reveal_anchor_ratio,
+            window.rem_size() * 2.0,
+        );
+        if needs_scroll_adjustment(
+            f64::from(f32::from(current.y)),
+            f64::from(f32::from(next_y)),
+        ) {
+            self.scroll_handle.set_offset(point(Pixels::ZERO, next_y));
+            window.refresh();
+        }
+    }
+
     fn enter_insert_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode == EditorMode::Insert {
             return;
@@ -212,9 +450,27 @@ impl DocumentWorkspace {
             self.command_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
+        let source_byte = self
+            .preview
+            .read(cx)
+            .selected_source_range()
+            .map(|range| range.start);
+        let preview_ratio = self.preview_scroll_ratio();
+        let editor_ratio = {
+            let source = self.editor.read(cx).value();
+            map_preview_ratio_to_editor_ratio(&source, preview_ratio)
+        };
+        self.pending_preview_sync = None;
+        self.pending_editor_sync = Some(PendingEditorSync::ApplyScroll {
+            ratio: editor_ratio,
+            source_byte,
+        });
         self.mode = EditorMode::Insert;
         self.editor
             .update(cx, |editor, cx| editor.focus(window, cx));
+        if source_byte.is_none() {
+            self.apply_scroll_ratio_to_editor(editor_ratio, cx);
+        }
         cx.notify();
     }
 
@@ -222,17 +478,47 @@ impl DocumentWorkspace {
         if self.mode == EditorMode::Normal {
             return;
         }
-        if self.mode == EditorMode::Command {
+        let sync = if self.mode == EditorMode::Command {
             self.selected_hint_ix = None;
             self.command_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
+            None
         } else {
-            let source = self.editor.read(cx).value();
+            let editor_ratio = self.editor_scroll_ratio(cx);
+            let (source, anchor_line) = {
+                let editor = self.editor.read(cx);
+                let max_y = editor_max_scroll_y(
+                    editor.content_height_f64(),
+                    f64::from(f32::from(editor.input_bounds().size.height)),
+                );
+                let scroll_y = editor.scroll_y_f64();
+                let cursor_line = editor.cursor_position().line as usize;
+                let anchor_line = editor.visible_row_range().map_or(cursor_line, |visible| {
+                    anchor_line_for_editor_viewport(
+                        visible,
+                        cursor_line,
+                        editor_ratio,
+                        scroll_y,
+                        max_y,
+                    )
+                });
+                (editor.value(), anchor_line)
+            };
+            let preview_ratio = map_editor_ratio_to_preview_ratio(&source, editor_ratio);
             self.preview
                 .update(cx, |preview, cx| preview.set_text(&source, cx));
-        }
+            Some(PendingPreviewSync {
+                ratio: preview_ratio,
+                anchor_line,
+            })
+        };
+        self.pending_editor_sync = None;
         self.mode = EditorMode::Normal;
         self.focus_handle.focus(window, cx);
+        if let Some(sync) = sync {
+            self.pending_preview_sync = Some(sync);
+            self.apply_scroll_ratio_to_preview(sync.ratio);
+        }
         cx.notify();
     }
 
@@ -371,6 +657,9 @@ impl DocumentWorkspace {
     fn execute_command_text(&mut self, raw: &str, window: &mut Window, cx: &mut Context<Self>) {
         match parse_command(raw) {
             Ok(Command::Noop) => cx.notify(),
+            Ok(Command::New { force }) => {
+                self.new_document(force, window, cx);
+            }
             Ok(Command::Write { path }) => {
                 let target = path.map(|raw_path| {
                     expand_user_path(&raw_path, self.current_directory().as_deref())
@@ -467,6 +756,28 @@ impl DocumentWorkspace {
         self.open_command_line(window, cx);
     }
 
+    fn on_scroll_down(&mut self, _: &ScrollDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_preview_by(-window.rem_size() * NORMAL_SCROLL_STEP_REMS, cx);
+    }
+
+    fn on_scroll_up(&mut self, _: &ScrollUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_preview_by(window.rem_size() * NORMAL_SCROLL_STEP_REMS, cx);
+    }
+
+    fn scroll_preview_by(&self, delta_y: Pixels, cx: &mut Context<Self>) {
+        if self.mode != EditorMode::Normal {
+            return;
+        }
+        let mut offset = self.scroll_handle.offset();
+        let max_y = self.scroll_handle.max_offset().y;
+        let next_y = clamp_scroll_offset(offset.y, delta_y, max_y);
+        if next_y != offset.y {
+            offset.y = next_y;
+            self.scroll_handle.set_offset(offset);
+            cx.notify();
+        }
+    }
+
     /// Catches `base::input::Escape` propagated from `InputState` / `TextareaState`.
     fn on_input_escape(
         &mut self,
@@ -483,8 +794,67 @@ impl DocumentWorkspace {
         }
     }
 
+    fn on_new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == EditorMode::Command {
+            self.close_command_line(window, cx);
+        }
+        self.new_document(false, window, cx);
+    }
+
+    fn new_document(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.io_in_flight {
+            return;
+        }
+        if !force && self.is_dirty {
+            self.show_notice(
+                StatusNotice::Error(SharedString::from(
+                    "Unsaved changes (save first or use :n! to discard)",
+                )),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+
+        self.editor
+            .update(cx, |editor, cx| editor.set_value("", window, cx));
+        self.preview
+            .update(cx, |preview, cx| preview.set_text("", cx));
+        self.path = None;
+        self.saved_source.clear();
+        self.is_dirty = false;
+        self.pending_editor_sync = None;
+        self.pending_preview_sync = None;
+        self.mode = EditorMode::Insert;
+        self.scroll_handle
+            .set_offset(point(Pixels::ZERO, Pixels::ZERO));
+        self.update_window_title(window);
+        self.editor
+            .update(cx, |editor, cx| editor.focus(window, cx));
+        self.show_notice(StatusNotice::Info(SharedString::from("New file")), cx);
+        cx.notify();
+    }
+
     fn on_open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
         self.open_file_dialog(window, cx);
+    }
+
+    fn on_drop_external_paths(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mode == EditorMode::Command {
+            self.close_command_line(window, cx);
+        }
+        match select_dropped_markdown(paths.paths()) {
+            Ok(path) => self.load_file_from_path(path, EditorMode::on_file_loaded(), window, cx),
+            Err(message) => {
+                self.show_notice(StatusNotice::Error(message.into()), cx);
+                cx.notify();
+            }
+        }
     }
 
     fn on_save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -669,6 +1039,8 @@ impl DocumentWorkspace {
                 self.is_dirty = false;
                 self.path = Some(path);
                 self.clear_notice();
+                self.pending_editor_sync = None;
+                self.pending_preview_sync = None;
                 self.mode = target_mode;
                 self.scroll_handle
                     .set_offset(point(Pixels::ZERO, Pixels::ZERO));
@@ -749,12 +1121,7 @@ impl DocumentWorkspace {
         cx.notify();
     }
 
-    fn render_editor_pane(&self, theme: &base::Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor_font = self
-            .document_font
-            .clone()
-            .unwrap_or_else(|| theme.tokens.typography.mono.clone());
-
+    fn render_editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("document-editor-pane")
             .flex()
@@ -768,6 +1135,7 @@ impl DocumentWorkspace {
             )
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -778,13 +1146,23 @@ impl DocumentWorkspace {
                     .px_8()
                     .pt_8()
                     .pb_6()
-                    .font_family(editor_font)
-                    .text_sm()
-                    .child(base::input::Textarea::new(&self.editor)),
+                    .when_some(self.document_font.clone(), |this, font| {
+                        this.font_family(font)
+                    })
+                    .child(base::input::Textarea::new(&self.editor))
+                    .when(self.pending_editor_sync.is_some(), |this| {
+                        let weak_this = cx.entity().downgrade();
+                        this.on_prepaint(move |_, window, cx| {
+                            _ = weak_this.update(cx, |this, cx| {
+                                this.sync_pending_editor_scroll(window, cx);
+                            });
+                        })
+                    }),
             )
     }
 
-    fn render_preview_pane(&self, theme: &base::Theme) -> impl IntoElement {
+    fn render_preview_pane(&self, theme: &base::Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let reveal_this = cx.entity().downgrade();
         div()
             .relative()
             .flex_1()
@@ -809,7 +1187,12 @@ impl DocumentWorkspace {
                             })
                             .child(
                                 base::TextView::new(&self.preview)
-                                    .style(theme::document_style(theme)),
+                                    .style(theme::document_style(theme))
+                                    .on_reveal(move |line_bounds, window, cx| {
+                                        _ = reveal_this.update(cx, |this, _| {
+                                            this.handle_preview_reveal(line_bounds, window);
+                                        });
+                                    }),
                             ),
                     ),
             )
@@ -820,6 +1203,14 @@ impl DocumentWorkspace {
                         .viewport_from_layout(),
                 ),
             )
+            .when(self.pending_preview_sync.is_some(), |this| {
+                let weak_this = cx.entity().downgrade();
+                this.on_prepaint(move |_, window, cx| {
+                    _ = weak_this.update(cx, |this, cx| {
+                        this.sync_pending_preview_scroll(window, cx);
+                    });
+                })
+            })
     }
 }
 
@@ -841,9 +1232,9 @@ impl Render for DocumentWorkspace {
             .map(|name| SharedString::from(name.to_string()));
 
         let content = match self.mode {
-            EditorMode::Insert => self.render_editor_pane(&theme, cx).into_any_element(),
+            EditorMode::Insert => self.render_editor_pane(cx).into_any_element(),
             EditorMode::Normal | EditorMode::Command => {
-                self.render_preview_pane(&theme).into_any_element()
+                self.render_preview_pane(&theme, cx).into_any_element()
             }
         };
 
@@ -862,15 +1253,22 @@ impl Render for DocumentWorkspace {
             .id("document-workspace")
             .key_context(self.mode.key_context())
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_new_file))
             .on_action(cx.listener(Self::on_open_file))
             .on_action(cx.listener(Self::on_save_file))
             .on_action(cx.listener(Self::on_enter_insert_mode))
             .on_action(cx.listener(Self::on_enter_normal_mode))
             .on_action(cx.listener(Self::on_open_command))
+            .on_action(cx.listener(Self::on_scroll_down))
+            .on_action(cx.listener(Self::on_scroll_up))
             .on_action(cx.listener(Self::on_command_next_hint))
             .on_action(cx.listener(Self::on_command_prev_hint))
             .on_action(cx.listener(Self::on_command_complete_hint))
             .on_action(cx.listener(Self::on_input_escape))
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.border_2().border_color(colors.ring)
+            })
+            .on_drop(cx.listener(Self::on_drop_external_paths))
             .relative()
             .flex()
             .flex_col()

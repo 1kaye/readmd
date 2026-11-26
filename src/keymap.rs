@@ -5,7 +5,7 @@ use gpui_kit::{Action, App, Global, KeyBinding, KeyBindingContextPredicate};
 
 use crate::document::{
     CommandCompleteHint, CommandNextHint, CommandPrevHint, EnterInsertMode, EnterNormalMode,
-    OpenCommand, OpenFile, SaveFile,
+    NewFile, OpenCommand, OpenFile, SaveFile, ScrollDown, ScrollUp,
 };
 
 const WORKSPACE_CONTEXT: &str = "DocumentWorkspace";
@@ -22,30 +22,39 @@ pub const DEFAULT_KEYMAPS_TOML: &str = "\
 #   chord      : \"space w\", \"j k\"
 #   multiple   : [\"i\", \"a\"]
 
+new_file = \"secondary-n\"
 open_file = \"secondary-o\"
 save_file = \"secondary-s\"
 enter_insert = \"i\"
 enter_normal = \"escape\"
 open_command = \":\"
+scroll_down = [\"j\", \"down\"]
+scroll_up = [\"k\", \"up\"]
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeymapConfig {
+    pub new_file: Vec<String>,
     pub open_file: Vec<String>,
     pub save_file: Vec<String>,
     pub enter_insert: Vec<String>,
     pub enter_normal: Vec<String>,
     pub open_command: Vec<String>,
+    pub scroll_down: Vec<String>,
+    pub scroll_up: Vec<String>,
 }
 
 impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
+            new_file: vec!["secondary-n".to_string()],
             open_file: vec!["secondary-o".to_string()],
             save_file: vec!["secondary-s".to_string()],
             enter_insert: vec!["i".to_string()],
             enter_normal: vec!["escape".to_string()],
             open_command: vec![":".to_string()],
+            scroll_down: vec!["j".to_string(), "down".to_string()],
+            scroll_up: vec!["k".to_string(), "up".to_string()],
         }
     }
 }
@@ -201,6 +210,13 @@ fn apply_bindings(
 
     push_bindings(
         &mut app_bindings,
+        &config.new_file,
+        || Box::new(NewFile),
+        &workspace_ctx,
+        cx,
+    )?;
+    push_bindings(
+        &mut app_bindings,
         &config.open_file,
         || Box::new(OpenFile),
         &workspace_ctx,
@@ -224,6 +240,20 @@ fn apply_bindings(
         &mut app_bindings,
         &config.open_command,
         || Box::new(OpenCommand),
+        &normal_ctx,
+        cx,
+    )?;
+    push_bindings(
+        &mut app_bindings,
+        &config.scroll_down,
+        || Box::new(ScrollDown),
+        &normal_ctx,
+        cx,
+    )?;
+    push_bindings(
+        &mut app_bindings,
+        &config.scroll_up,
+        || Box::new(ScrollUp),
         &normal_ctx,
         cx,
     )?;
@@ -334,11 +364,14 @@ pub fn parse_keymaps_toml(source: &str) -> Result<KeymapConfig, String> {
             .map_err(|err| format!("line {line_no} ({key}): {err}"))?;
 
         match key {
+            "new_file" => config.new_file = values,
             "open_file" => config.open_file = values,
             "save_file" => config.save_file = values,
             "enter_insert" => config.enter_insert = values,
             "enter_normal" => config.enter_normal = values,
             "open_command" => config.open_command = values,
+            "scroll_down" => config.scroll_down = values,
+            "scroll_up" => config.scroll_up = values,
             _ => return Err(format!("line {line_no}: unknown keybind '{key}'")),
         }
     }

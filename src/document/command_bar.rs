@@ -17,7 +17,6 @@ use crate::theme;
 type DismissHandler = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 type SelectHintHandler = Rc<dyn Fn(SharedString, &mut Window, &mut App)>;
 
-/// Dead-simple square top-center LazyVim-style command-line input with live English hints.
 #[derive(IntoElement)]
 pub struct CommandBar {
     input: Entity<base::input::InputState>,
@@ -65,7 +64,6 @@ impl RenderOnce for CommandBar {
         let theme = base::Theme::global(cx);
         let colors = theme.tokens.colors;
         let badge = theme::mode_badge_colors(&theme, EditorMode::Command);
-        let mono = theme.tokens.typography.mono.clone();
         let has_hints_panel = !self.hints.items.is_empty() || self.hints.footer.is_some();
         let on_select_hint = self.on_select_hint;
         let selected_ix = self.selected_ix;
@@ -96,7 +94,7 @@ impl RenderOnce for CommandBar {
                     .border_1()
                     .border_color(colors.ring)
                     .shadow(theme.tokens.shadow.md.clone())
-                    .font_family(mono)
+                    .font_family(theme::APP_UI_FONT)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         // Keep clicks inside the command box and hints from dismissing it.
                         cx.stop_propagation();

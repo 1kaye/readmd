@@ -1,11 +1,12 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    App, ClickEvent, InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window,
+    App, ClickEvent, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathBuilder,
+    RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
     base::{self, StyledExt as _},
-    div,
+    canvas, div, point,
     prelude::FluentBuilder as _,
+    relative, rems,
 };
 
 use super::EditorMode;
@@ -19,9 +20,7 @@ pub enum StatusNotice {
     Error(SharedString),
 }
 
-/// Dead-simple LazyVim-style bottom status bar:
-/// mode box (`INSERT` / `NORMAL` / `COMMAND`) anchored bottom-left, subtle file/dirty/status
-/// beside it, and reserved open space on the right for future settings.
+/// and transient status/error notices right-aligned on the right.
 #[derive(IntoElement)]
 pub struct StatusBar {
     mode: EditorMode,
@@ -66,12 +65,33 @@ impl StatusBar {
     }
 }
 
+fn mode_ribbon_tip(color: Hsla) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let mut builder = PathBuilder::fill();
+            builder.move_to(bounds.origin);
+            builder.line_to(point(
+                bounds.right(),
+                bounds.origin.y + bounds.size.height / 2.0,
+            ));
+            builder.line_to(point(bounds.origin.x, bounds.bottom()));
+            builder.close();
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .w(rems(0.45))
+    .h_full()
+    .flex_shrink_0()
+}
+
 impl RenderOnce for StatusBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = base::Theme::global(cx);
         let colors = theme.tokens.colors;
         let badge = theme::mode_badge_colors(&theme, self.mode);
-        let mono = theme.tokens.typography.mono.clone();
 
         let file_label = match (self.file_name, self.is_dirty) {
             (Some(name), true) => Some(SharedString::from(format!("{name} [+]"))),
@@ -88,42 +108,72 @@ impl RenderOnce for StatusBar {
             .justify_between()
             .flex_shrink_0()
             .w_full()
+            .h(rems(1.375))
+            .gap_3()
             .bg(colors.surface)
             .border_t_1()
             .border_color(colors.border)
+            .font_family(theme::APP_UI_FONT)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
+                    .h_full()
                     .min_w_0()
-                    .flex_1()
-                    .gap_3()
+                    .flex_shrink_0()
+                    .gap_2p5()
                     .child(
                         div()
                             .id("status-bar-mode")
+                            .flex()
+                            .flex_row()
+                            .items_stretch()
+                            .h_full()
                             .flex_shrink_0()
-                            .px_3()
-                            .py_1()
-                            .bg(badge.background)
-                            .text_color(badge.foreground)
-                            .font_family(mono)
-                            .text_xs()
-                            .font_bold()
                             .when_some(self.on_toggle_mode, |this, handler| {
                                 this.on_click(move |event, window, cx| handler(event, window, cx))
                             })
-                            .child(self.mode.label()),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .h_full()
+                                    .pl_2p5()
+                                    .pr_1p5()
+                                    .bg(badge.background)
+                                    .text_color(badge.foreground)
+                                    .text_size(rems(0.6875))
+                                    .line_height(relative(1.0))
+                                    .font_bold()
+                                    .child(self.mode.label()),
+                            )
+                            .child(mode_ribbon_tip(badge.background)),
                     )
                     .when_some(file_label, |this, label| {
                         this.child(
                             div()
                                 .flex_shrink_0()
-                                .text_xs()
+                                .text_size(rems(0.6875))
+                                .line_height(relative(1.0))
                                 .text_color(colors.muted_foreground)
                                 .child(label),
                         )
-                    })
+                    }),
+            )
+            // Right-side status area: displays transient saved/font/error notices.
+            .child(
+                div()
+                    .id("status-bar-right")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .h_full()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_2()
+                    .px_2p5()
                     .when_some(self.notice, |this, notice| {
                         let (text, color) = match notice {
                             StatusNotice::Info(msg) => (msg, colors.muted_foreground),
@@ -133,22 +183,12 @@ impl RenderOnce for StatusBar {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_xs()
+                                .text_size(rems(0.6875))
+                                .line_height(relative(1.0))
                                 .text_color(color)
                                 .child(text),
                         )
                     }),
-            )
-            // Reserved right-side slot for future settings controls.
-            .child(
-                div()
-                    .id("status-bar-right")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .flex_shrink_0()
-                    .gap_2()
-                    .px_3(),
             )
     }
 }

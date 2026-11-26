@@ -7,6 +7,7 @@ pub const MAX_VISIBLE_HINTS: usize = 10;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Noop,
+    New { force: bool },
     Write { path: Option<String> },
     Quit { force: bool },
     WriteQuit { path: Option<String> },
@@ -67,6 +68,20 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         insert_text: "q!",
     },
     CommandSpec {
+        name: "n",
+        aliases: &["new", "enew"],
+        label: "n",
+        description: "Create a new blank file",
+        insert_text: "n",
+    },
+    CommandSpec {
+        name: "n!",
+        aliases: &["new!", "enew!"],
+        label: "n!",
+        description: "Discard changes and create a new file",
+        insert_text: "n!",
+    },
+    CommandSpec {
         name: "e",
         aliases: &["edit", "o", "open"],
         label: "e [path]",
@@ -101,6 +116,8 @@ pub fn parse_command(raw: &str) -> Result<Command, String> {
     }
 
     match name {
+        "n" | "new" | "enew" => ensure_no_arg(name, arg, Command::New { force: false }),
+        "n!" | "new!" | "enew!" => ensure_no_arg(name, arg, Command::New { force: true }),
         "w" | "write" => Ok(Command::Write { path: arg }),
         "q" | "quit" => ensure_no_arg(name, arg, Command::Quit { force: false }),
         "q!" | "quit!" => ensure_no_arg(name, arg, Command::Quit { force: true }),
@@ -110,7 +127,6 @@ pub fn parse_command(raw: &str) -> Result<Command, String> {
     }
 }
 
-/// Builds live English hints for the current command-line text.
 /// Typing `:Font ` switches hints into a live-filtered list of installed system fonts.
 pub fn command_hints(
     raw: &str,
@@ -142,21 +158,21 @@ pub fn command_hints(
             .aliases
             .iter()
             .any(|alias| alias.to_ascii_lowercase().starts_with(&query));
-        let alias_contains = spec
-            .aliases
-            .iter()
-            .any(|alias| alias.to_ascii_lowercase().contains(&query));
 
         if name_lower.starts_with(&query) || alias_prefix {
             prefix_matches.push(spec_to_hint(spec));
-        } else if name_lower.contains(&query) || alias_contains {
+        } else if name_lower.contains(&query) {
             contains_matches.push(spec_to_hint(spec));
         }
     }
 
-    prefix_matches.extend(contains_matches);
+    let items = if prefix_matches.is_empty() {
+        contains_matches
+    } else {
+        prefix_matches
+    };
     HintList {
-        items: prefix_matches,
+        items,
         footer: None,
     }
 }
@@ -342,6 +358,9 @@ mod tests {
     fn parses_write_quit_open_and_font_commands() {
         assert_eq!(parse_command(""), Ok(Command::Noop));
         assert_eq!(parse_command("   "), Ok(Command::Noop));
+        assert_eq!(parse_command("n"), Ok(Command::New { force: false }));
+        assert_eq!(parse_command(":new"), Ok(Command::New { force: false }));
+        assert_eq!(parse_command("n!"), Ok(Command::New { force: true }));
         assert_eq!(parse_command("w"), Ok(Command::Write { path: None }));
         assert_eq!(parse_command(":write"), Ok(Command::Write { path: None }));
         assert_eq!(
@@ -385,13 +404,17 @@ mod tests {
     }
 
     #[test]
-    fn command_hints_filter_w_to_w_and_wq_with_english_descriptions() {
+    fn command_hints_filter_w_and_n_with_english_descriptions() {
         let fonts = sample_fonts();
-        let hints = command_hints("w", &fonts, None);
-        let labels: Vec<&str> = hints.items.iter().map(|h| h.label.as_ref()).collect();
-        assert_eq!(labels, vec!["w [path]", "wq [path]"]);
-        assert!(hints.items[0].description.contains("Save"));
-        assert!(hints.items[1].description.contains("quit"));
+        let w_hints = command_hints("w", &fonts, None);
+        let w_labels: Vec<&str> = w_hints.items.iter().map(|h| h.label.as_ref()).collect();
+        assert_eq!(w_labels, vec!["w [path]", "wq [path]"]);
+        assert!(w_hints.items[0].description.contains("Save"));
+        assert!(w_hints.items[1].description.contains("quit"));
+
+        let n_hints = command_hints("n", &fonts, None);
+        let n_labels: Vec<&str> = n_hints.items.iter().map(|h| h.label.as_ref()).collect();
+        assert_eq!(n_labels, vec!["n", "n!"]);
     }
 
     #[test]

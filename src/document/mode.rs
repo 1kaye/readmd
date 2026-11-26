@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 pub const APP_TITLE: &str = "readmd";
 
-/// LazyVim-style modal editing mode for a Markdown document.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EditorMode {
     /// Plain-text Markdown editing mode (default when opening a blank session).
@@ -42,6 +41,26 @@ impl EditorMode {
     pub fn on_file_loaded() -> Self {
         Self::Normal
     }
+}
+
+const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mkd", "mdx"];
+
+pub fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            MARKDOWN_EXTENSIONS
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+        })
+}
+
+pub fn select_dropped_markdown(paths: &[PathBuf]) -> Result<PathBuf, String> {
+    paths
+        .iter()
+        .find(|path| is_markdown_path(path))
+        .cloned()
+        .ok_or_else(|| "Drop a Markdown file (.md, .markdown, .mkd)".to_string())
 }
 
 pub fn load_markdown_file(path: &Path) -> Result<String, String> {
@@ -93,10 +112,28 @@ pub fn window_title_for_state(path: Option<&Path>, is_dirty: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_TITLE, EditorMode, expand_user_path, file_display_name, load_markdown_file,
-        save_markdown_file, window_title_for_state,
+        APP_TITLE, EditorMode, expand_user_path, file_display_name, is_markdown_path,
+        load_markdown_file, save_markdown_file, select_dropped_markdown, window_title_for_state,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn select_dropped_markdown_picks_first_markdown_and_rejects_others() {
+        assert!(is_markdown_path(Path::new("README.MD")));
+        assert!(is_markdown_path(Path::new("notes.markdown")));
+        assert!(is_markdown_path(Path::new("doc.mkd")));
+        assert!(!is_markdown_path(Path::new("image.png")));
+
+        let mixed = vec![PathBuf::from("photo.png"), PathBuf::from("/docs/guide.md")];
+        assert_eq!(
+            select_dropped_markdown(&mixed),
+            Ok(PathBuf::from("/docs/guide.md"))
+        );
+
+        let non_md = vec![PathBuf::from("notes.txt"), PathBuf::from("folder")];
+        assert!(select_dropped_markdown(&non_md).is_err());
+        assert!(select_dropped_markdown(&[]).is_err());
+    }
 
     #[test]
     fn default_mode_is_insert_and_file_load_enters_normal() {
